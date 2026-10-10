@@ -20,6 +20,11 @@
  *  tcp_mmap -s -z -M $((4096+12)) &
  *  tcp_mmap -H ::1 -z -M $((4096+12))
  *
+ * Receiver options to study how long mmap'ed pages stay referenced:
+ *  -N <n>     rotate TCP_ZEROCOPY_RECEIVE over n chunk-sized slots of the mapping
+ *  -k         do not madvise(MADV_DONTNEED) received chunks (needs -N > 1 to matter)
+ *  -D <usec>  sleep after each mmap'ed chunk to emulate a slow consumer
+ *
  * Note: -z option on sender uses MSG_ZEROCOPY, which forces a copy when packets go through loopback interface.
  *       We might use sendfile() instead, but really this test program is about mmap(), for receivers ;)
  *
@@ -85,8 +90,10 @@ static int rcvbuf; /* Default: autotuning.  Can be set with -r <integer> option 
 static int sndbuf; /* Default: autotuning.  Can be set with -w <integer> option */
 static int zflg; /* zero copy option. (MSG_ZEROCOPY for sender, mmap() for receiver */
 static int xflg; /* hash received data (simple xor) (-h option) */
-static int keepflag; /* -k option: receiver shall keep all received file in memory (no munmap() calls) */
+static int keepflag; /* -k option: receiver keeps mapped chunks (no madvise(MADV_DONTNEED)). Only useful with -N > 1 */
 static int integrity; /* -i option: sender and receiver compute sha256 over the data.*/
+static int nr_slots = 1; /* -N option: receiver rotates through this many chunk-sized mmap slots */
+static unsigned int delay_usec; /* -D option: receiver sleeps after each mmap'ed chunk (slow consumer) */
 
 static size_t chunk_size  = 512*1024;
 
@@ -181,7 +188,8 @@ void *child_thread(void *arg)
 	double throughput;
 	struct rusage ru;
 	size_t buffer_sz;
-	int lu, fd;
+	size_t map_sz = 0;
+	int lu, fd, slot = 0;
 
 	fd = (int)(unsigned long)arg;
 
@@ -194,7 +202,8 @@ void *child_thread(void *arg)
 		goto error;
 	}
 	if (zflg) {
-		raddr = mmap(NULL, chunk_size + map_align, PROT_READ, flags, fd, 0);
+		map_sz = nr_slots * chunk_size + map_align;
+		raddr = mmap(NULL, map_sz, PROT_READ, flags, fd, 0);
 		if (raddr == MAP_FAILED) {
 			perror("mmap");
 			zflg = 0;
@@ -216,11 +225,12 @@ void *child_thread(void *arg)
 
 		poll(&pfd, 1, 10000);
 		if (zflg) {
+			void *slot_addr = addr + slot * chunk_size;
 			socklen_t zc_len = sizeof(zc);
 			int res;
 
 			memset(&zc, 0, sizeof(zc));
-			zc.address = (__u64)((unsigned long)addr);
+			zc.address = (__u64)((unsigned long)slot_addr);
 			zc.length = min(chunk_size, FILE_SZ - total);
 
 			res = getsockopt(fd, IPPROTO_TCP, TCP_ZEROCOPY_RECEIVE,
@@ -231,15 +241,22 @@ void *child_thread(void *arg)
 			if (zc.length) {
 				assert(zc.length <= chunk_size);
 				if (integrity)
-					EVP_DigestUpdate(ctx, addr, zc.length);
+					EVP_DigestUpdate(ctx, slot_addr, zc.length);
 				total_mmap += zc.length;
 				if (xflg)
-					hash_zone(addr, zc.length);
+					hash_zone(slot_addr, zc.length);
 				/* It is more efficient to unmap the pages right now,
 				 * instead of doing this in next TCP_ZEROCOPY_RECEIVE.
+				 * With -k, keep them mapped: with -N > 1 the next
+				 * TCP_ZEROCOPY_RECEIVE targets another slot, so up to
+				 * nr_slots chunks stay mapped at the same time.
 				 */
-				madvise(addr, zc.length, MADV_DONTNEED);
+				if (!keepflag)
+					madvise(slot_addr, zc.length, MADV_DONTNEED);
 				total += zc.length;
+				slot = (slot + 1) % nr_slots;
+				if (delay_usec)
+					usleep(delay_usec);
 			}
 			if (zc.recv_skip_hint) {
 				assert(zc.recv_skip_hint <= chunk_size);
@@ -318,7 +335,7 @@ error:
 	munmap(buffer, buffer_sz);
 	close(fd);
 	if (zflg)
-		munmap(raddr, chunk_size + map_align);
+		munmap(raddr, map_sz);
 	pthread_exit(0);
 }
 
@@ -456,7 +473,7 @@ int main(int argc, char *argv[])
 	int sflg = 0;
 	int mss = 0;
 
-	while ((c = getopt(argc, argv, "46p:svr:w:H:zxkP:M:C:a:i")) != -1) {
+	while ((c = getopt(argc, argv, "46p:svr:w:H:zxkP:M:C:a:iN:D:")) != -1) {
 		switch (c) {
 		case '4':
 			cfg_family = PF_INET;
@@ -504,6 +521,14 @@ int main(int argc, char *argv[])
 			break;
 		case 'i':
 			integrity = 1;
+			break;
+		case 'N':
+			nr_slots = atoi(optarg);
+			if (nr_slots < 1)
+				error(1, 0, "-N needs a positive number of slots");
+			break;
+		case 'D':
+			delay_usec = atoi(optarg);
 			break;
 		default:
 			exit(1);
