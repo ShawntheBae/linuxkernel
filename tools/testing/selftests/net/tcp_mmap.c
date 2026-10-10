@@ -24,6 +24,7 @@
  *  -N <n>     rotate TCP_ZEROCOPY_RECEIVE over n chunk-sized slots of the mapping
  *  -k         do not madvise(MADV_DONTNEED) received chunks (needs -N > 1 to matter)
  *  -D <usec>  sleep after each mmap'ed chunk to emulate a slow consumer
+ *  -R         set TCP_ZEROCOPY_RECYCLE before mmap() (needs -z)
  *
  * Note: -z option on sender uses MSG_ZEROCOPY, which forces a copy when packets go through loopback interface.
  *       We might use sendfile() instead, but really this test program is about mmap(), for receivers ;)
@@ -77,6 +78,10 @@
 #define MSG_ZEROCOPY    0x4000000
 #endif
 
+#ifndef TCP_ZEROCOPY_RECYCLE
+#define TCP_ZEROCOPY_RECYCLE	47
+#endif
+
 #ifndef min
 #define min(a, b)  ((a) < (b) ? (a) : (b))
 #endif
@@ -94,6 +99,7 @@ static int keepflag; /* -k option: receiver keeps mapped chunks (no madvise(MADV
 static int integrity; /* -i option: sender and receiver compute sha256 over the data.*/
 static int nr_slots = 1; /* -N option: receiver rotates through this many chunk-sized mmap slots */
 static unsigned int delay_usec; /* -D option: receiver sleeps after each mmap'ed chunk (slow consumer) */
+static int recycle; /* -R option: receiver sets TCP_ZEROCOPY_RECYCLE before mmap() */
 
 static size_t chunk_size  = 512*1024;
 
@@ -200,6 +206,14 @@ void *child_thread(void *arg)
 	if (buffer == MAP_FAILED) {
 		perror("mmap");
 		goto error;
+	}
+	/* Must be set before mmap(): the kernel decides the mode at mmap() time. */
+	if (zflg && recycle) {
+		int one = 1;
+
+		if (setsockopt(fd, IPPROTO_TCP, TCP_ZEROCOPY_RECYCLE,
+			       &one, sizeof(one)))
+			error(1, errno, "setsockopt TCP_ZEROCOPY_RECYCLE");
 	}
 	if (zflg) {
 		map_sz = nr_slots * chunk_size + map_align;
@@ -473,7 +487,7 @@ int main(int argc, char *argv[])
 	int sflg = 0;
 	int mss = 0;
 
-	while ((c = getopt(argc, argv, "46p:svr:w:H:zxkP:M:C:a:iN:D:")) != -1) {
+	while ((c = getopt(argc, argv, "46p:svr:w:H:zxkP:M:C:a:iN:D:R")) != -1) {
 		switch (c) {
 		case '4':
 			cfg_family = PF_INET;
@@ -529,6 +543,9 @@ int main(int argc, char *argv[])
 			break;
 		case 'D':
 			delay_usec = atoi(optarg);
+			break;
+		case 'R':
+			recycle = 1;
 			break;
 		default:
 			exit(1);

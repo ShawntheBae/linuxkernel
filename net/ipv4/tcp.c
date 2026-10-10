@@ -2328,7 +2328,7 @@ out:
 		tcp_rcv_space_adjust(sk);
 
 		/* Clean up data we have read: This will do ACK frames. */
-		tcp_recv_skb(sk, seq, &offset);
+		tcp_recv_skb(sk, seq, &offset); //BAE SKB cannot be free cuz refcount = 2
 		tcp_cleanup_rbuf(sk, length + copylen);
 		ret = 0;
 		if (length == zc->length)
@@ -4150,6 +4150,12 @@ ao_parse:
 		else
 			tp->recvmsg_inq = val;
 		break;
+	case TCP_ZEROCOPY_RECYCLE:
+		if (val > 1 || val < 0)
+			err = -EINVAL;
+		else
+			tp->zc_recycle = val;
+		break;
 	case TCP_TX_DELAY:
 		/* tp->srtt_us is u32, and is shifted by 3 */
 		if (val < 0 || val >= (1U << (31 - 3))) {
@@ -4709,6 +4715,9 @@ int do_tcp_getsockopt(struct sock *sk, int level,
 		break;
 	case TCP_INQ:
 		val = tp->recvmsg_inq;
+		break;
+	case TCP_ZEROCOPY_RECYCLE:
+		val = tp->zc_recycle;
 		break;
 	case TCP_SAVE_SYN:
 		val = tp->save_syn;
