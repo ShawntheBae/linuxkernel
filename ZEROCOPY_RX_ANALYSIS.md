@@ -369,7 +369,8 @@ if (skb->pp_recycle && netmem_is_pp(nm)) {
 명시적 반환 경로는 선택 사항이다.
 - **v1에서 생략할 수 있다.** 이 경우 위 한계를 받아들이고, 보류 페이지는 최대 슬롯 수만큼 munmap 전까지 남는다.
 - 즉시 반환이 필요하면 새 데이터 없이 부를 수 있는 경로가 필요하다. 예: `setsockopt(TCP_ZEROCOPY_RELEASE, {address, length})`. 구현은 작다(`find_tcp_vma()` → 소유자 검사 → `tcp_zc_zap()` 재사용). 측정에서 잔류 페이지가 문제로 보이면 추가한다.
-- 소켓 종료 경로(`tcp_close`, `tcp_v4_destroy_sock`, `tcp_minisocks.c`)는 **고칠 필요가 없다.** VMA가 파일 참조를 쥐고 있어서([mm/vma.c:514-515](mm/vma.c#L514-L515), `.close` 다음에 `fput`) region이 소켓보다 항상 먼저 정리되기 때문이다.
+- 소켓 종료 경로(`tcp_close`, `tcp_v4_destroy_sock`)는 **고칠 필요가 없다.** VMA가 파일 참조를 쥐고 있어서([mm/vma.c:514-515](mm/vma.c#L514-L515), `.close` 다음에 `fput`) region이 소켓보다 항상 먼저 정리되기 때문이다.
+- 단, 소켓의 "현재 region" 포인터(`tp->zc_region`)는 **accept 소켓 생성 시 지워야 한다.** accept 소켓은 리스너를 통째로 복사해 만들어지므로(`sk_clone()` → `sock_copy()`의 `memcpy`, [net/core/sock.c:2210](net/core/sock.c#L2210)), 지우지 않으면 리스너의 region 주소를 물려받는다. `tcp_create_openreq_child()`에서 `fastopen_req`처럼 NULL로 지운다([net/ipv4/tcp_minisocks.c:662](net/ipv4/tcp_minisocks.c#L662)).
 
 **(6) 상한과 회계**
 
@@ -597,6 +598,6 @@ sysctl -w net.ipv4.tcp_rmem="4096 131072 67108864"
 | 5 | [net/ipv4/tcp.c](net/ipv4/tcp.c#L2062) | `tcp_zerocopy_vm_insert_batch*()`, `tcp_zerocopy_receive()` | **`find_tcp_vma()` 직후 `region->owner == sk` 검사 (최우선)**, `zap_vma_range()` 두 곳을 `tcp_zc_zap()`으로 교체, 삽입 성공분 슬롯 기록 (`skb->pp_recycle` 전달) |
 | 6 | [tools/testing/selftests/net/tcp_mmap.c](tools/testing/selftests/net/tcp_mmap.c) | `child_thread()` | `-R`, `-N`, `-k`, `-D` 옵션 |
 
-초기 설계와 달리 `tcp_ipv4.c`(소켓 파괴), `tcp_minisocks.c`(accept 소켓 초기화)는 수정하지 않는다. 기록이 소켓이 아니라 VMA에 있기 때문이다.
+초기 설계와 달리 `tcp_ipv4.c`(소켓 파괴)는 수정하지 않는다. 기록이 소켓이 아니라 VMA에 있기 때문이다. `tcp_minisocks.c`는 accept 소켓이 리스너의 `zc_region` 포인터를 물려받지 않도록 **한 줄**(`newtp->zc_region = NULL`)만 추가한다.
 
 브랜치: 원본은 `zerocopy` 브랜치에 두고, 작업은 별도 브랜치(예: `zc-defer-release`)에서 한다.

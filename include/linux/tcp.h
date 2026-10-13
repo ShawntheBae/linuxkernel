@@ -194,6 +194,8 @@ static inline bool tcp_rsk_used_ao(const struct request_sock *req)
 
 #define TCP_RMEM_TO_WIN_SCALE 8
 
+struct tcp_zc_region;
+
 struct tcp_sock {
 	/* Cacheline organization can be found documented in
 	 * Documentation/networking/net_cachelines/tcp_sock.rst.
@@ -528,6 +530,9 @@ struct tcp_sock {
 	 */
 	struct request_sock __rcu *fastopen_rsk;
 	struct saved_syn *saved_syn;
+
+/* TCP_ZEROCOPY_RECYCLE: the one mmap() region of this socket, or NULL */
+	struct tcp_zc_region *zc_region;
 };
 
 enum tsq_enum {

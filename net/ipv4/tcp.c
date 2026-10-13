@@ -264,6 +264,7 @@
 #include <linux/err.h>
 #include <linux/time.h>
 #include <linux/slab.h>
+#include <linux/kref.h>
 #include <linux/errqueue.h>
 #include <linux/static_key.h>
 #include <linux/btf.h>
@@ -1860,8 +1861,105 @@ void tcp_set_rcvbuf(struct sock *sk, int val)
 }
 
 #ifdef CONFIG_MMU
-static const struct vm_operations_struct tcp_vm_ops = {
+/* TCP_ZEROCOPY_RECYCLE: one region per mmap() of a socket that set the option.
+ * slots[i] holds the page_pool page mapped at vm_start + i * PAGE_SIZE, with
+ * an extra pp reference, so that page_pool sees the page only after the user
+ * mapping is gone and can recycle it.
+ */
+struct tcp_zc_region {
+	struct kref	ref;		/* VMA references (vm_ops->open/close) */
+	struct sock	*owner;		/* socket that mmap()ed it, compare only */
+	unsigned long	nr_slots;	/* vma_pages() at mmap() time */
+	unsigned long	nr_held;	/* number of non-zero slots */
+	netmem_ref	slots[];
 };
+
+/* Called when the last VMA referencing the region goes away. The page tables
+ * of the region are already zapped at this point.
+ */
+static void tcp_zc_region_release(struct kref *ref)
+{
+	struct tcp_zc_region *r = container_of(ref, struct tcp_zc_region, ref);
+
+	/* Allow the owner to mmap() a new region. */
+	cmpxchg(&tcp_sk(r->owner)->zc_region, r, NULL);
+	kvfree(r);
+}
+
+/* The hooks below do nothing for VMAs without a region (legacy mode). */
+
+/* A copy of the VMA now shares the region (e.g. mremap() before it fails). */
+static void tcp_vm_open(struct vm_area_struct *vma)
+{
+	struct tcp_zc_region *r = vma->vm_private_data;
+
+	if (r)
+		kref_get(&r->ref);
+}
+
+/* munmap() or process exit: the VMA goes away after its PTEs were zapped. */
+static void tcp_vm_close(struct vm_area_struct *vma)
+{
+	struct tcp_zc_region *r = vma->vm_private_data;
+
+	if (r)
+		kref_put(&r->ref, tcp_zc_region_release);
+}
+
+/* Slots are indexed from vm_start: a region VMA must never be split. */
+static int tcp_vm_may_split(struct vm_area_struct *vma, unsigned long addr)
+{
+	return vma->vm_private_data ? -EINVAL : 0;
+}
+
+/* Likewise, a region VMA must not move. */
+static int tcp_vm_mremap(struct vm_area_struct *vma)
+{
+	return vma->vm_private_data ? -EINVAL : 0;
+}
+
+static const struct vm_operations_struct tcp_vm_ops = {
+	.open		= tcp_vm_open,
+	.close		= tcp_vm_close,
+	.may_split	= tcp_vm_may_split,
+	.mremap		= tcp_vm_mremap,
+};
+
+/* A region can pin at most what the socket could buffer: tcp_rmem[2]. */
+static unsigned long tcp_zc_region_max_pages(const struct sock *sk)
+{
+	return READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_rmem[2]) >> PAGE_SHIFT;
+}
+
+/* Attach a TCP_ZEROCOPY_RECYCLE region to a new VMA. On error the caller
+ * fails the mmap() and the VMA is discarded without vm_ops->close().
+ */
+static int tcp_zc_region_attach(struct sock *sk, struct vm_area_struct *vma)
+{
+	unsigned long nr = vma_pages(vma);
+	struct tcp_zc_region *r;
+
+	if (nr > tcp_zc_region_max_pages(sk))
+		return -EINVAL;
+
+	r = kvzalloc(struct_size(r, slots, nr), GFP_KERNEL);
+	if (!r)
+		return -ENOMEM;
+	kref_init(&r->ref);
+	r->owner = sk;
+	r->nr_slots = nr;
+
+	/* One region per socket. */
+	if (cmpxchg(&tcp_sk(sk)->zc_region, NULL, r)) {
+		kvfree(r);
+		return -EBUSY;
+	}
+
+	/* Slots are indexed from vm_start: no copy on fork, no growth. */
+	vm_flags_set(vma, VM_DONTCOPY | VM_DONTEXPAND);
+	vma->vm_private_data = r;
+	return 0;
+}
 
 int tcp_mmap(struct file *file, struct socket *sock,
 	     struct vm_area_struct *vma)
@@ -1872,6 +1970,13 @@ int tcp_mmap(struct file *file, struct socket *sock,
 
 	/* Instruct vm_insert_page() to not mmap_read_lock(mm) */
 	vm_flags_set(vma, VM_MIXEDMAP);
+
+	if (tcp_sk(sock->sk)->zc_recycle) {
+		int err = tcp_zc_region_attach(sock->sk, vma);
+
+		if (err)
+			return err;
+	}
 
 	vma->vm_ops = &tcp_vm_ops;
 	return 0;
