@@ -2305,6 +2305,7 @@ static int tcp_zerocopy_receive(struct sock *sk,
 	unsigned long address = (unsigned long)zc->address;
 	struct page *pages[TCP_ZEROCOPY_PAGE_BATCH_SIZE];
 	s32 copybuf_len = zc->copybuf_len;
+	struct tcp_zc_region *zc_region;
 	struct tcp_sock *tp = tcp_sk(sk);
 	const skb_frag_t *frags = NULL;
 	unsigned int pages_to_map = 0;
@@ -2341,6 +2342,19 @@ static int tcp_zerocopy_receive(struct sock *sk,
 	vma = find_tcp_vma(current->mm, address, &mmap_locked);
 	if (!vma)
 		return -EINVAL;
+
+	/* A region's slots are serialized by its owner's socket lock: another
+	 * socket must not map into it. Checked before any zap or slot access.
+	 * Unlock here, as the out: path below may turn the error into -EIO.
+	 */
+	zc_region = vma->vm_private_data;
+	if (zc_region && zc_region->owner != sk) {
+		if (mmap_locked)
+			mmap_read_unlock(current->mm);
+		else
+			vma_end_read(vma);
+		return -EINVAL;
+	}
 
 	vma_len = min_t(unsigned long, zc->length, vma->vm_end - address);
 	avail_len = min_t(u32, vma_len, inq);
