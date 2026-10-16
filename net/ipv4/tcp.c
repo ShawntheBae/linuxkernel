@@ -265,6 +265,7 @@
 #include <linux/time.h>
 #include <linux/slab.h>
 #include <linux/kref.h>
+#include <linux/skbuff_ref.h>
 #include <linux/errqueue.h>
 #include <linux/static_key.h>
 #include <linux/btf.h>
@@ -1874,6 +1875,30 @@ struct tcp_zc_region {
 	netmem_ref	slots[];
 };
 
+/* Return the pp references held in slots [first, first + nr). The caller
+ * guarantees that the user mapping of these pages is gone (PTEs zapped and
+ * TLB flushed), so page_pool may recycle them right away.
+ */
+static void tcp_zc_region_put_slots(struct tcp_zc_region *r,
+				    unsigned long first, unsigned long nr)
+{
+	unsigned long i, end = min(first + nr, r->nr_slots);
+
+	/* Only page_pool pages are ever put in slots. */
+	if (!IS_ENABLED(CONFIG_PAGE_POOL))
+		return;
+
+	for (i = first; i < end; i++) {
+		netmem_ref netmem = r->slots[i];
+
+		if (!netmem)
+			continue;
+		r->slots[i] = 0;
+		r->nr_held--;
+		WARN_ON_ONCE(!napi_pp_put_page(netmem));
+	}
+}
+
 /* Called when the last VMA referencing the region goes away. The page tables
  * of the region are already zapped at this point.
  */
@@ -1881,6 +1906,7 @@ static void tcp_zc_region_release(struct kref *ref)
 {
 	struct tcp_zc_region *r = container_of(ref, struct tcp_zc_region, ref);
 
+	tcp_zc_region_put_slots(r, 0, r->nr_slots);
 	/* Allow the owner to mmap() a new region. */
 	cmpxchg(&tcp_sk(r->owner)->zc_region, r, NULL);
 	kvfree(r);
@@ -2164,6 +2190,20 @@ static int tcp_zc_handle_leftover(struct tcp_zerocopy_receive *zc,
 	return zc->copybuf_len < 0 ? 0 : copylen;
 }
 
+/* zap_vma_range() for a TCP mmap() VMA. The user mapping is gone when
+ * zap_vma_range() returns, so the slots of that range can be returned too.
+ */
+static void tcp_zc_zap(struct vm_area_struct *vma, unsigned long address,
+		       unsigned long size)
+{
+	struct tcp_zc_region *r = vma->vm_private_data;
+
+	zap_vma_range(vma, address, size);
+	if (r)
+		tcp_zc_region_put_slots(r, (address - vma->vm_start) >> PAGE_SHIFT,
+					size >> PAGE_SHIFT);
+}
+
 static int tcp_zerocopy_vm_insert_batch_error(struct vm_area_struct *vma,
 					      struct page **pending_pages,
 					      unsigned long pages_remaining,
@@ -2182,7 +2222,7 @@ static int tcp_zerocopy_vm_insert_batch_error(struct vm_area_struct *vma,
 		maybe_zap_len = total_bytes_to_map -  /* All bytes to map */
 				*length + /* Mapped or pending */
 				(pages_remaining * PAGE_SIZE); /* Failed map. */
-		zap_vma_range(vma, *address, maybe_zap_len);
+		tcp_zc_zap(vma, *address, maybe_zap_len);
 		err = 0;
 	}
 
@@ -2361,7 +2401,7 @@ static int tcp_zerocopy_receive(struct sock *sk,
 	total_bytes_to_map = avail_len & ~(PAGE_SIZE - 1);
 	if (total_bytes_to_map) {
 		if (!(zc->flags & TCP_RECEIVE_ZEROCOPY_FLAG_TLB_CLEAN_HINT))
-			zap_vma_range(vma, address, total_bytes_to_map);
+			tcp_zc_zap(vma, address, total_bytes_to_map);
 		zc->length = total_bytes_to_map;
 		zc->recv_skip_hint = 0;
 	} else {
