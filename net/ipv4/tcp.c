@@ -266,6 +266,7 @@
 #include <linux/slab.h>
 #include <linux/kref.h>
 #include <linux/skbuff_ref.h>
+#include <net/page_pool/helpers.h>
 #include <linux/errqueue.h>
 #include <linux/static_key.h>
 #include <linux/btf.h>
@@ -2204,6 +2205,37 @@ static void tcp_zc_zap(struct vm_area_struct *vma, unsigned long address,
 					size >> PAGE_SHIFT);
 }
 
+/* Remember the pages just mapped at [address, address + nr * PAGE_SIZE) and
+ * take an extra pp reference on each, so that page_pool decides on recycling
+ * only once the user mapping is gone (tcp_zc_zap() or region release).
+ * The caller still holds the skb, hence a pp reference, on these pages.
+ */
+static void tcp_zc_region_record(struct vm_area_struct *vma,
+				 unsigned long address, struct page **pages,
+				 unsigned long nr, bool pp_recycle)
+{
+	struct tcp_zc_region *r = vma->vm_private_data;
+	unsigned long i, idx;
+
+	if (!r)
+		return;
+
+	idx = (address - vma->vm_start) >> PAGE_SHIFT;
+	for (i = 0; i < nr && idx + i < r->nr_slots; i++) {
+		/* The insert succeeded, so this PTE was empty: a page still
+		 * held by the slot is no longer mapped here. Return it first.
+		 */
+		tcp_zc_region_put_slots(r, idx + i, 1);
+
+		/* Only page_pool pages of page_pool skbs use pp_ref_count. */
+		if (!pp_recycle || !page_pool_page_is_pp(pages[i]))
+			continue;
+		page_pool_ref_page(pages[i]);
+		r->slots[idx + i] = page_to_netmem(pages[i]);
+		r->nr_held++;
+	}
+}
+
 static int tcp_zerocopy_vm_insert_batch_error(struct vm_area_struct *vma,
 					      struct page **pending_pages,
 					      unsigned long pages_remaining,
@@ -2212,7 +2244,7 @@ static int tcp_zerocopy_vm_insert_batch_error(struct vm_area_struct *vma,
 					      u32 *seq,
 					      struct tcp_zerocopy_receive *zc,
 					      u32 total_bytes_to_map,
-					      int err)
+					      int err, bool pp_recycle)
 {
 	/* At least one page did not map. Try zapping if we skipped earlier. */
 	if (err == -EBUSY &&
@@ -2234,6 +2266,9 @@ static int tcp_zerocopy_vm_insert_batch_error(struct vm_area_struct *vma,
 		err = vm_insert_pages(vma, *address,
 				      pending_pages,
 				      &pages_remaining);
+		tcp_zc_region_record(vma, *address, pending_pages,
+				     leftover_pages - pages_remaining,
+				     pp_recycle);
 		bytes_mapped = PAGE_SIZE * (leftover_pages - pages_remaining);
 		*seq += bytes_mapped;
 		*address += bytes_mapped;
@@ -2259,7 +2294,8 @@ static int tcp_zerocopy_vm_insert_batch(struct vm_area_struct *vma,
 					u32 *length,
 					u32 *seq,
 					struct tcp_zerocopy_receive *zc,
-					u32 total_bytes_to_map)
+					u32 total_bytes_to_map,
+					bool pp_recycle)
 {
 	unsigned long pages_remaining = pages_to_map;
 	unsigned int pages_mapped;
@@ -2272,6 +2308,7 @@ static int tcp_zerocopy_vm_insert_batch(struct vm_area_struct *vma,
 	/* Even if vm_insert_pages fails, it may have partially succeeded in
 	 * mapping (some but not all of the pages).
 	 */
+	tcp_zc_region_record(vma, *address, pages, pages_mapped, pp_recycle);
 	*seq += bytes_mapped;
 	*address += bytes_mapped;
 
@@ -2281,7 +2318,7 @@ static int tcp_zerocopy_vm_insert_batch(struct vm_area_struct *vma,
 	/* Error: maybe zap and retry + rollback state for failed inserts. */
 	return tcp_zerocopy_vm_insert_batch_error(vma, pages + pages_mapped,
 		pages_remaining, address, length, seq, zc, total_bytes_to_map,
-		err);
+		err, pp_recycle);
 }
 
 #define TCP_VALID_ZC_MSG_FLAGS   (TCP_CMSG_TS)
@@ -2462,7 +2499,8 @@ static int tcp_zerocopy_receive(struct sock *sk,
 							   pages_to_map,
 							   &address, &length,
 							   &seq, zc,
-							   total_bytes_to_map);
+							   total_bytes_to_map,
+							   skb->pp_recycle);
 			if (ret)
 				goto out;
 			pages_to_map = 0;
@@ -2471,7 +2509,8 @@ static int tcp_zerocopy_receive(struct sock *sk,
 	if (pages_to_map) {
 		ret = tcp_zerocopy_vm_insert_batch(vma, pages, pages_to_map,
 						   &address, &length, &seq,
-						   zc, total_bytes_to_map);
+						   zc, total_bytes_to_map,
+						   skb->pp_recycle);
 	}
 out:
 	if (mmap_locked)
